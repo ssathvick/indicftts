@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""
+Phase 5: Indian Language TTS using IndicF5
+
+This script is designed to be called directly or by:
+
+08_run_full_dubbing_pipeline.py
+
+Input:
+- Translated segment JSON from Phase 4
+
+Output:
+- Segment-level WAV files
+- Full aligned dubbed WAV track
+- Optional MP3
+- Manifest JSON
+
+Example:
+
+python 05_tts_any_indian_language.py \
+  --language hindi \
+  --input-json /mnt/d/aistudio/audio_pipeline/output/translations/demo_hindi_segments.json \
+  --output-dir /mnt/d/aistudio/audio_pipeline/output/tts \
+  --model ai4bharat/IndicF5 \
+  --ref-audio /mnt/d/aistudio/audio_pipeline/input/prompts/male_hindi_ref_24k_mono.wav \
+  --ref-text-file /mnt/d/aistudio/audio_pipeline/input/prompts/male_hindi_ref.txt \
+  --output-name demo_hindi_dubbed_track \
+  --export-sample-rate 48000 \
+  --audio-channels 1 \
+  --export-mp3
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import librosa
+import numpy as np
+import soundfile as sf
+import torch
+from tqdm import tqdm
+from transformers import AutoModel
+
+
+MODEL_SAMPLE_RATE = 24000
+
+
+LANGUAGE_ALIASES = {
+    "hi": "hindi",
+    "hindi": "hindi",
+
+    "kn": "kannada",
+    "kannada": "kannada",
+
+    "ta": "tamil",
+    "tamil": "tamil",
+
+    "te": "telugu",
+    "telugu": "telugu",
+
+    "ml": "malayalam",
+    "malayalam": "malayalam",
+
+    "mr": "marathi",
+    "marathi": "marathi",
+
+    "bn": "bengali",
+    "bengali": "bengali",
+    "bangla": "bengali",
+
+    "gu": "gujarati",
+    "gujarati": "gujarati",
+
+    "pa": "punjabi",
+    "punjabi": "punjabi",
+
+    "or": "odia",
+    "odia": "odia",
+    "oriya": "odia",
+
+    "as": "assamese",
+    "assamese": "assamese",
+}
+
+
+SUPPORTED_LANGUAGES = {
+    "hindi",
+    "kannada",
+    "tamil",
+    "telugu",
+    "malayalam",
+    "marathi",
+    "bengali",
+    "gujarati",
+    "punjabi",
+    "odia",
+    "assamese",
+}
+
+
+def normalize_language(language: str) -> str:
+    language = language.strip().lower()
+    return LANGUAGE_ALIASES.get(language, language)
+
+
+def load_reference_text(ref_text: Optional[str], ref_text_file: Optional[str]) -> str:
+    if ref_text_file:
+        path = Path(ref_text_file)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Reference text file not found: {path}")
+
+        text = path.read_text(encoding="utf-8").strip()
+
+        if not text:
+            raise ValueError(f"Reference text file is empty: {path}")
+
+        return text
+
+    if ref_text and ref_text.strip():
+        return ref_text.strip()
+
+    raise ValueError(
+        "You must provide either --ref-text or --ref-text-file. "
+        "The reference text must exactly match the speech in the reference audio."
+    )
+
+
+def load_segments(input_json: Path) -> List[Dict]:
+    if not input_json.exists():
+        raise FileNotFoundError(f"Input JSON not found: {input_json}")
+
+    with input_json.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, list):
+        raise ValueError("Input JSON must be a list of segment objects.")
+
+    return data
+
+
+def get_segment_text(segment: Dict) -> str:
+    possible_keys = [
+        "translated_text",
+        "translation",
+        "target_text",
+        "text",
+    ]
+
+    for key in possible_keys:
+        value = segment.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def get_segment_start_end(segment: Dict, index: int) -> Tuple[float, float]:
+    if "start" not in segment or "end" not in segment:
+        raise ValueError(
+            f"Segment {index} is missing 'start' or 'end'. "
+            "The translated JSON must preserve timing fields from transcription."
+        )
+
+    start = float(segment["start"])
+    end = float(segment["end"])
+
+    if end <= start:
+        end = start + 0.5
+
+    return start, end
+
+
+def normalize_audio(audio: np.ndarray, peak_target: float = 0.90) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+
+    if audio.size == 0:
+        return audio.astype(np.float32)
+
+    peak = float(np.max(np.abs(audio)))
+
+    if peak > 0:
+        audio = audio / peak * peak_target
+
+    return audio.astype(np.float32)
+
+
+def safe_time_stretch(
+    audio: np.ndarray,
+    target_samples: int,
+    max_stretch_rate: float,
+) -> np.ndarray:
+    if len(audio) <= target_samples:
+        return audio
+
+    stretch_rate = len(audio) / target_samples
+    safe_rate = min(stretch_rate, max_stretch_rate)
+
+    try:
+        stretched = librosa.effects.time_stretch(audio, rate=safe_rate)
+        return stretched.astype(np.float32)
+    except Exception as error:
+        print(f"Warning: time-stretch failed. Will trim instead. Error: {error}")
+        return audio
+
+
+def fit_to_duration(
+    audio: np.ndarray,
+    target_duration: float,
+    sample_rate: int,
+    max_stretch_rate: float,
+    allow_time_stretch: bool,
+) -> np.ndarray:
+    target_samples = max(1, int(target_duration * sample_rate))
+
+    if len(audio) == 0:
+        return np.zeros(target_samples, dtype=np.float32)
+
+    if allow_time_stretch and len(audio) > target_samples:
+        audio = safe_time_stretch(
+            audio=audio,
+            target_samples=target_samples,
+            max_stretch_rate=max_stretch_rate,
+        )
+
+    if len(audio) > target_samples:
+        audio = audio[:target_samples]
+
+    elif len(audio) < target_samples:
+        pad = target_samples - len(audio)
+        audio = np.pad(audio, (0, pad), mode="constant")
+
+    return audio.astype(np.float32)
+
+
+def apply_fade(audio: np.ndarray, sample_rate: int, fade_ms: int) -> np.ndarray:
+    if fade_ms <= 0 or len(audio) == 0:
+        return audio
+
+    fade_samples = int(sample_rate * fade_ms / 1000)
+
+    if fade_samples <= 0:
+        return audio
+
+    fade_samples = min(fade_samples, len(audio) // 2)
+
+    if fade_samples <= 0:
+        return audio
+
+    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+
+    audio[:fade_samples] *= fade_in
+    audio[-fade_samples:] *= fade_out
+
+    return audio.astype(np.float32)
+
+
+def run_ffmpeg_export(
+    input_wav: Path,
+    output_audio: Path,
+    export_sample_rate: int,
+    audio_channels: int,
+    bitrate: Optional[str] = None,
+) -> None:
+    output_audio.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_wav),
+        "-ar",
+        str(export_sample_rate),
+        "-ac",
+        str(audio_channels),
+    ]
+
+    if bitrate and output_audio.suffix.lower() == ".mp3":
+        command.extend(["-b:a", bitrate])
+
+    command.append(str(output_audio))
+
+    print("\nRunning FFmpeg export:")
+    print(" ".join(command))
+
+    subprocess.run(command, check=True)
+
+
+def write_manifest(manifest: List[Dict], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, ensure_ascii=False, indent=2)
+
+
+def convert_model_output_to_numpy(audio) -> np.ndarray:
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+
+    audio = np.asarray(audio)
+
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    else:
+        audio = audio.astype(np.float32)
+
+    if audio.ndim > 1:
+        audio = np.squeeze(audio)
+
+    return audio
+
+
+def load_indicf5_model(model_name: str, device: str):
+    print("Loading IndicF5 model...")
+    print(f"Model: {model_name}")
+
+    model = AutoModel.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+    )
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device == "cuda" and torch.cuda.is_available():
+        try:
+            model = model.to("cuda")
+            print("Model moved to CUDA.")
+        except Exception as error:
+            print(f"Warning: could not move model to CUDA directly: {error}")
+            print("Continuing. Model may still use CUDA internally if supported.")
+    else:
+        print("Using CPU or model default device.")
+
+    return model
+
+
+def generate_segment_audio(
+    model,
+    text: str,
+    ref_audio_path: Path,
+    reference_text: str,
+    normalize_segment_audio: bool = False,
+    peak_target: float = 0.90,
+) -> np.ndarray:
+    """
+    Generate natural TTS audio for one translated segment.
+
+    By default this function does NOT normalize or scale the generated audio.
+    This keeps the model output closer to its natural sound and avoids
+    "hollow / well-like" artifacts caused by unnecessary post-processing.
+    """
+
+    audio = model(
+        text,
+        ref_audio_path=str(ref_audio_path),
+        ref_text=reference_text,
+    )
+
+    audio = convert_model_output_to_numpy(audio)
+
+    if normalize_segment_audio:
+        audio = normalize_audio(audio, peak_target=peak_target)
+
+    return audio.astype(np.float32)
+
+
+def generate_tts_track(args) -> None:
+    """
+    Generate translated audio naturally.
+
+    Important production change:
+    This version does NOT force generated speech to match original segment
+    durations. It does not time-stretch, trim, pad, or place audio at original
+    timestamps unless explicitly requested with --sync-to-source-timing.
+
+    Default mode:
+        translated segment 1 audio
+        + pause
+        + translated segment 2 audio
+        + pause
+        ...
+
+    This is best when the earlier duration scaling/time-stretching made the
+    voice sound shallow, hollow, or like it is coming from a well.
+    """
+
+    language = normalize_language(args.language)
+
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Unsupported Indian language for IndicF5: {language}\n"
+            f"Supported languages: {', '.join(sorted(SUPPORTED_LANGUAGES))}"
+        )
+
+    input_json = Path(args.input_json)
+    output_dir = Path(args.output_dir)
+    ref_audio_path = Path(args.ref_audio)
+    reference_text = load_reference_text(args.ref_text, args.ref_text_file)
+
+    if not ref_audio_path.exists():
+        raise FileNotFoundError(f"Reference audio not found: {ref_audio_path}")
+
+    segments = load_segments(input_json)
+
+    if args.limit > 0:
+        segments = segments[:args.limit]
+
+    if not segments:
+        raise ValueError("No segments found in input JSON.")
+
+    output_name = args.output_name or f"{language}_dubbed_track"
+
+    raw_wav_path = output_dir / f"{output_name}_24k.wav"
+    final_wav_path = output_dir / f"{output_name}_{args.export_sample_rate // 1000}k.wav"
+    final_mp3_path = output_dir / f"{output_name}_{args.export_sample_rate // 1000}k.mp3"
+    manifest_path = output_dir / f"{output_name}_manifest.json"
+    segment_dir = output_dir / f"{output_name}_segments"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    segment_dir.mkdir(parents=True, exist_ok=True)
+
+    mode = "SOURCE TIMING SYNC" if args.sync_to_source_timing else "NATURAL TRANSLATED AUDIO"
+
+    print("\n============================================================")
+    print("PHASE 5: INDIAN LANGUAGE TTS USING INDICF5")
+    print("============================================================")
+    print(f"Mode                  : {mode}")
+    print(f"Language              : {language}")
+    print(f"Input JSON            : {input_json}")
+    print(f"Output directory      : {output_dir}")
+    print(f"Output name           : {output_name}")
+    print(f"Model                 : {args.model}")
+    print(f"Device                : {args.device}")
+    print(f"Reference audio       : {ref_audio_path}")
+    print(f"Reference text file   : {args.ref_text_file if args.ref_text_file else 'Not used'}")
+    print(f"Reference text chars  : {len(reference_text)}")
+    print(f"Model sample rate     : {MODEL_SAMPLE_RATE}")
+    print(f"Export sample rate    : {args.export_sample_rate}")
+    print(f"Audio channels        : {args.audio_channels}")
+    print(f"Natural pause seconds : {args.natural_pause_seconds}")
+    print(f"Normalize segments    : {args.normalize_segments}")
+    print(f"Normalize final       : {args.normalize_final}")
+    print(f"CUDA available        : {torch.cuda.is_available()}")
+    print(f"GPU                   : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print("============================================================\n")
+
+    model = load_indicf5_model(
+        model_name=args.model,
+        device=args.device,
+    )
+
+    manifest = []
+    natural_parts = []
+    current_natural_time = 0.0
+    pause_audio = np.zeros(int(args.natural_pause_seconds * MODEL_SAMPLE_RATE), dtype=np.float32)
+
+    # Only used if the caller explicitly requests old source-timing behavior.
+    if args.sync_to_source_timing:
+        valid_end_times = [
+            float(segment["end"])
+            for segment in segments
+            if "end" in segment
+        ]
+
+        if not valid_end_times:
+            raise ValueError("No valid segment end times found in input JSON.")
+
+        max_end = max(valid_end_times)
+        full_track_samples = int((max_end + args.tail_padding_seconds) * MODEL_SAMPLE_RATE)
+        full_track = np.zeros(full_track_samples, dtype=np.float32)
+    else:
+        full_track = None
+
+    for index, segment in enumerate(tqdm(segments, desc=f"Generating {language} TTS")):
+        start, end = get_segment_start_end(segment, index)
+        source_duration = max(0.1, end - start)
+        text = get_segment_text(segment)
+
+        if not text:
+            print(f"Skipping empty segment {index}")
+            continue
+
+        print("\n------------------------------------------------------------")
+        print(f"Segment {index}")
+        print(f"Source time      : {start:.2f}s → {end:.2f}s")
+        print(f"Source duration  : {source_duration:.2f}s")
+        print(f"Text             : {text[:200]}")
+        print("------------------------------------------------------------")
+
+        try:
+            generated_audio = generate_segment_audio(
+                model=model,
+                text=text,
+                ref_audio_path=ref_audio_path,
+                reference_text=reference_text,
+                normalize_segment_audio=args.normalize_segments,
+                peak_target=args.peak_target,
+            )
+        except Exception as error:
+            if args.continue_on_error:
+                print(f"ERROR generating segment {index}. Inserting silence. Error: {error}")
+                generated_audio = np.zeros(int(source_duration * MODEL_SAMPLE_RATE), dtype=np.float32)
+            else:
+                raise
+
+        generated_duration = len(generated_audio) / MODEL_SAMPLE_RATE
+
+        if args.fade_ms > 0:
+            generated_audio = apply_fade(
+                audio=generated_audio.copy(),
+                sample_rate=MODEL_SAMPLE_RATE,
+                fade_ms=args.fade_ms,
+            )
+
+        segment_audio_path = segment_dir / f"{language}_segment_{index:04d}.wav"
+        sf.write(str(segment_audio_path), generated_audio, MODEL_SAMPLE_RATE)
+
+        if args.sync_to_source_timing:
+            # Legacy mode, disabled by default.
+            # This mode can cause hollow/smeared sound because it forces translated
+            # speech into the original source segment timing.
+            segment_for_track = fit_to_duration(
+                audio=generated_audio,
+                target_duration=source_duration,
+                sample_rate=MODEL_SAMPLE_RATE,
+                max_stretch_rate=args.max_stretch_rate,
+                allow_time_stretch=not args.disable_time_stretch,
+            )
+
+            start_sample = int(start * MODEL_SAMPLE_RATE)
+            end_sample = start_sample + len(segment_for_track)
+
+            if end_sample > len(full_track):
+                full_track = np.pad(
+                    full_track,
+                    (0, end_sample - len(full_track)),
+                    mode="constant",
+                )
+
+            full_track[start_sample:end_sample] += segment_for_track
+            final_start = start
+            final_end = start + (len(segment_for_track) / MODEL_SAMPLE_RATE)
+            final_duration = len(segment_for_track) / MODEL_SAMPLE_RATE
+
+        else:
+            # New default: natural translated audio, no duration scaling.
+            final_start = current_natural_time
+            final_end = final_start + generated_duration
+            final_duration = generated_duration
+
+            natural_parts.append(generated_audio)
+
+            if args.natural_pause_seconds > 0 and index < len(segments) - 1:
+                natural_parts.append(pause_audio)
+
+            current_natural_time = final_end + args.natural_pause_seconds
+
+        manifest.append(
+            {
+                "index": index,
+                "language": language,
+                "source_start": start,
+                "source_end": end,
+                "source_duration_seconds": source_duration,
+                "natural_start": final_start,
+                "natural_end": final_end,
+                "generated_duration_seconds": generated_duration,
+                "final_duration_seconds": final_duration,
+                "scaled_to_source_timing": bool(args.sync_to_source_timing),
+                "text": text,
+                "segment_audio": str(segment_audio_path),
+                "source_segment": segment,
+            }
+        )
+
+    if args.sync_to_source_timing:
+        output_track = full_track
+    else:
+        if natural_parts:
+            output_track = np.concatenate(natural_parts).astype(np.float32)
+        else:
+            output_track = np.zeros(int(args.tail_padding_seconds * MODEL_SAMPLE_RATE), dtype=np.float32)
+
+        if args.tail_padding_seconds > 0:
+            tail = np.zeros(int(args.tail_padding_seconds * MODEL_SAMPLE_RATE), dtype=np.float32)
+            output_track = np.concatenate([output_track, tail]).astype(np.float32)
+
+    if args.normalize_final:
+        output_track = normalize_audio(output_track, peak_target=args.peak_target)
+
+    sf.write(str(raw_wav_path), output_track, MODEL_SAMPLE_RATE)
+    write_manifest(manifest, manifest_path)
+
+    print("\nRaw model-rate WAV saved:")
+    print(raw_wav_path)
+
+    print("\nManifest saved:")
+    print(manifest_path)
+
+    run_ffmpeg_export(
+        input_wav=raw_wav_path,
+        output_audio=final_wav_path,
+        export_sample_rate=args.export_sample_rate,
+        audio_channels=args.audio_channels,
+    )
+
+    if args.export_mp3:
+        run_ffmpeg_export(
+            input_wav=raw_wav_path,
+            output_audio=final_mp3_path,
+            export_sample_rate=args.export_sample_rate,
+            audio_channels=args.audio_channels,
+            bitrate=args.mp3_bitrate,
+        )
+
+    if not args.keep_model_rate_wav:
+        try:
+            raw_wav_path.unlink()
+            print(f"\nRemoved temporary raw model-rate WAV: {raw_wav_path}")
+        except Exception as error:
+            print(f"\nWarning: could not remove raw model-rate WAV: {error}")
+
+    print("\n============================================================")
+    print("PHASE 5 INDIAN TTS COMPLETE")
+    print("============================================================")
+    print(f"Mode      : {mode}")
+    print(f"Final WAV : {final_wav_path}")
+
+    if args.export_mp3:
+        print(f"Final MP3 : {final_mp3_path}")
+
+    print(f"Segments  : {segment_dir}")
+    print(f"Manifest  : {manifest_path}")
+    print("============================================================\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Phase 5: Convert translated Indian-language text segments into TTS audio using IndicF5."
+    )
+
+    parser.add_argument(
+        "--language",
+        required=True,
+        help="Target Indian language name/code: hindi, kannada, tamil, telugu, hi, kn, ta, te, etc.",
+    )
+
+    parser.add_argument(
+        "--input-json",
+        required=True,
+        help="Translated segments JSON path from Phase 4.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="/mnt/d/aistudio/audio_pipeline/output/tts",
+        help="Output directory for generated TTS audio.",
+    )
+
+    parser.add_argument(
+        "--output-name",
+        default=None,
+        help="Base output name. If omitted, language_dubbed_track will be used.",
+    )
+
+    parser.add_argument(
+        "--model",
+        default="ai4bharat/IndicF5",
+        help="Hugging Face model name. Default: ai4bharat/IndicF5.",
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=["cuda", "cpu", "auto"],
+        help="Device preference. Default: cuda.",
+    )
+
+    parser.add_argument(
+        "--ref-audio",
+        required=True,
+        help="Reference voice audio path. Recommended: 24 kHz mono WAV.",
+    )
+
+    parser.add_argument(
+        "--ref-text",
+        default=None,
+        help="Exact text spoken in reference audio. Optional if --ref-text-file is provided.",
+    )
+
+    parser.add_argument(
+        "--ref-text-file",
+        default=None,
+        help="UTF-8 text file containing exact text spoken in reference audio.",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process only first N segments for testing. Use 0 for full file.",
+    )
+
+    parser.add_argument(
+        "--export-sample-rate",
+        type=int,
+        default=48000,
+        help="Final export sample rate. Recommended: 48000 for video.",
+    )
+
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        default=1,
+        help="Final export channels. Recommended: 1 for voice, 2 for stereo.",
+    )
+
+    parser.add_argument(
+        "--export-mp3",
+        action="store_true",
+        help="Also export MP3.",
+    )
+
+    parser.add_argument(
+        "--mp3-bitrate",
+        default="192k",
+        help="MP3 bitrate when --export-mp3 is enabled.",
+    )
+
+    parser.add_argument(
+        "--keep-model-rate-wav",
+        action="store_true",
+        help="Keep the raw 24 kHz model-rate WAV.",
+    )
+
+    parser.add_argument(
+        "--max-stretch-rate",
+        type=float,
+        default=1.25,
+        help="Maximum time-stretch compression rate. Recommended: 1.15 to 1.25.",
+    )
+
+    parser.add_argument(
+        "--disable-time-stretch",
+        action="store_true",
+        help="Disable time-stretching and only trim/pad generated speech.",
+    )
+
+    parser.add_argument(
+        "--fade-ms",
+        type=int,
+        default=8,
+        help="Small fade-in/out in milliseconds for each segment.",
+    )
+
+    parser.add_argument(
+        "--tail-padding-seconds",
+        type=float,
+        default=1.0,
+        help="Extra silence after final segment.",
+    )
+
+    parser.add_argument(
+        "--peak-target",
+        type=float,
+        default=0.90,
+        help="Peak normalization target for generated full track.",
+    )
+
+    parser.add_argument(
+        "--natural-pause-seconds",
+        type=float,
+        default=0.25,
+        help="Pause inserted between naturally generated translated segments. Used only when not syncing to source timing.",
+    )
+
+    parser.add_argument(
+        "--normalize-segments",
+        action="store_true",
+        help="Normalize each generated segment. Disabled by default to avoid hollow/scaled sound.",
+    )
+
+    parser.add_argument(
+        "--normalize-final",
+        action="store_true",
+        help="Normalize final full track. Disabled by default to preserve natural TTS dynamics.",
+    )
+
+    parser.add_argument(
+        "--sync-to-source-timing",
+        action="store_true",
+        help="Legacy mode: force generated speech into original source timestamps using trim/pad/time-stretch. Disabled by default.",
+    )
+
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="If a segment fails, insert silence instead of stopping.",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    generate_tts_track(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print("\nERROR:")
+        print(error)
+        sys.exit(1)
